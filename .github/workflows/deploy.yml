@@ -23,6 +23,9 @@ jobs:
       run: npm ci
 
     - name: Build Frontend
+      env:
+        VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_GOOGLE_CLIENT_ID }}
+        VITE_API_URL: https://report.leip.co.in/api
       run: npm run build
 
     - name: Copy Files to VPS via SSH
