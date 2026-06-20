@@ -1,0 +1,107 @@
+[
+  {
+    "email": "marketing01@laserxprts.com",
+    "name": "Vivek Kumar",
+    "role": "manager",
+    "department": "Marketing",
+    "managed_departments": "[\"INVENTORY\"]"
+  },
+  {
+    "email": "admin@lei.com",
+    "name": "System Admin",
+    "role": "admin",
+    "department": "",
+    "managed_departments": null
+  },
+  {
+    "email": "accounts2@laserxprts.com",
+    "name": "Dinesh ",
+    "role": "manager",
+    "department": "ACC & FIN",
+    "managed_departments": "[\"Marketing\",\"Engineering\"]"
+  },
+  {
+    "email": "harisha.prabakaran@laserxprts.com",
+    "name": "Harisha Praba",
+    "role": "manager",
+    "department": "Finance & account ",
+    "managed_departments": null
+  },
+  {
+    "email": "stock.hsr@gmail.com",
+    "name": "DHARANI DAYALAN",
+    "role": "user",
+    "department": "INVENTORY",
+    "managed_departments": null
+  },
+  {
+    "email": "stock.hsr@laserxprts.com",
+    "name": "DHARANI DAYALAN",
+    "role": "user",
+    "department": "INVENTORY",
+    "managed_departments": null
+  },
+  {
+    "email": "Pd@laserxprts.com",
+    "name": "Mahesh Rao R",
+    "role": "admin",
+    "department": "People Development",
+    "managed_departments": null
+  },
+  {
+    "email": "frandsource@gmail.com",
+    "name": "GOVINDHA S",
+    "role": "user",
+    "department": "FRND",
+    "managed_departments": null
+  },
+  {
+    "email": "krubanesan@gmail.com",
+    "name": "K Rubanesan",
+    "role": "user",
+    "department": "FRND",
+    "managed_departments": null
+  },
+  {
+    "email": "suryasurideee@gmail.com",
+    "name": "Surya  k",
+    "role": "user",
+    "department": "FRND ",
+    "managed_departments": null
+  },
+  {
+    "email": "elavarasanj059@gmail.com",
+    "name": "Elavarasan ",
+    "role": "user",
+    "department": "FRND ",
+    "managed_departments": null
+  },
+  {
+    "email": "havocraki398@gmail.com",
+    "name": "Rakesh",
+    "role": "user",
+    "department": "FRND",
+    "managed_departments": null
+  },
+  {
+    "email": "sjagadeshwaran101@gmail.com",
+    "name": "Jagadeshwaran S",
+    "role": "user",
+    "department": "FRND",
+    "managed_departments": null
+  },
+  {
+    "email": "admin@gmail.com",
+    "name": "Admin Test",
+    "role": "user",
+    "department": "Engineering",
+    "managed_departments": null
+  },
+  {
+    "email": "verify-admin@gmail.com",
+    "name": "Verification Admin",
+    "role": "admin",
+    "department": null,
+    "managed_departments": null
+  }
+]

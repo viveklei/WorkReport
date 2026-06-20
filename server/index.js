@@ -1,0 +1,553 @@
+console.log('--- Server Script Initializing ---');
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Explicitly load .env from the server directory
+import dotenv from 'dotenv';
+try {
+  dotenv.config({ path: path.join(__dirname, '.env') });
+  console.log('Environment variables loaded from server/.env');
+} catch (envErr) {
+  console.error('Error loading .env file:', envErr.message);
+}
+
+import express from 'express';
+import cors from 'cors';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { db, initDB } from './db.js';
+import rateLimit from 'express-rate-limit';
+
+const app = express();
+
+// --- SHARED UTILITIES ---
+const safeParse = (str, fallback = []) => {
+  if (!str) return fallback;
+  try {
+    return JSON.parse(str);
+  } catch (e) {
+    console.error('JSON Parse Error:', e.message, 'Input:', str);
+    return fallback;
+  }
+};
+
+
+// --- EARLY HEALTH CHECK (Before anything else) ---
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    env: process.env.NODE_ENV || 'development',
+    port: process.env.PORT || 'not-set-by-host'
+  });
+});
+
+console.log('Express app instance created');
+const PORT = process.env.PORT || 5003; 
+const JWT_SECRET = process.env.JWT_SECRET || 'lei-report-portal-secret-key-2026';
+
+console.log(`Final PORT to be used: ${PORT}`);
+
+
+
+// CORS configuration - allow production frontend and localhost for dev
+const allowedOrigins = [
+  'https://reports.leip.co.in',
+  'http://reports.leip.co.in',
+  'https://report.leip.co.in',
+  'http://report.leip.co.in',
+  'http://localhost:5173',
+  'http://localhost:4173',
+  'http://127.0.0.1:5173'
+];
+
+
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(null, true); // Allow all during initial deployment
+  },
+  credentials: true
+}));
+app.use(express.json({ limit: '200mb' }));
+
+// Serve static files from React build
+const distPath = path.join(__dirname, '..', 'dist');
+app.use(express.static(distPath));
+
+// Rate limiting
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5000, // Increased to 5000 to be extremely safe
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res, next, options) => {
+    res.status(options.statusCode).json(options.message);
+  }
+});
+app.use(limiter);
+
+// Initialize DB
+console.log('Initializing Database...');
+try {
+  initDB();
+  console.log('Database initialized successfully');
+} catch (dbErr) {
+  console.error('DATABASE INITIALIZATION FAILED:', dbErr);
+}
+
+// --- Authentication Routes ---
+
+app.post('/api/register', async (req, res) => {
+  const { email, password, name, department, designation, reporting_person, photo } = req.body;
+  
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
+
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    // Check if this is the first user
+    db.get(`SELECT COUNT(*) as count FROM users`, [], (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      
+      const role = (row.count === 0 || email === 'admin@lei.com') ? 'admin' : 'user';
+
+      db.run(
+        `INSERT INTO users (email, password, name, department, designation, reporting_person, photo, role) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [email, hashedPassword, name, department, designation, reporting_person, photo, role],
+        function(err) {
+          if (err) {
+            if (err.message && err.message.includes('UNIQUE constraint failed')) {
+              return res.status(400).json({ error: 'User already exists' });
+            }
+            return res.status(500).json({ error: err.message });
+          }
+          res.status(201).json({ message: 'User registered successfully', userId: this.lastID, role });
+        }
+      );
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error during registration' });
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  db.get(`SELECT * FROM users WHERE email = ?`, [email], async (err, user) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!user) return res.status(400).json({ error: 'Invalid email or password' });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ error: 'Invalid email or password' });
+
+    const token = jwt.sign({ email: user.email, id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
+    
+    // Remove password before sending user data
+    const { password: _, ...userWithoutPassword } = user;
+    res.json({ token, user: userWithoutPassword });
+  });
+});
+
+// Verify Google Token (Supports secure Google API verification & local base64 Mock verification)
+async function verifyGoogleToken(credential) {
+  try {
+    const decoded = Buffer.from(credential, 'base64').toString('utf-8');
+    if (decoded.includes('"mock":true')) {
+      return JSON.parse(decoded);
+    }
+  } catch (e) {
+    // Not a mock base64 token, proceed with actual Google Verification
+  }
+
+  const verifyUrl = `https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`;
+  const response = await fetch(verifyUrl);
+  if (!response.ok) {
+    throw new Error('Failed to verify Google Token');
+  }
+  const payload = await response.json();
+  
+  const client_id = process.env.GOOGLE_CLIENT_ID;
+  if (client_id && payload.aud !== client_id) {
+    throw new Error('Google token audience mismatch');
+  }
+  
+  return payload;
+}
+
+app.post('/api/auth/google', async (req, res) => {
+  const { credential } = req.body;
+  if (!credential) {
+    return res.status(400).json({ error: 'Credential token is required' });
+  }
+
+  try {
+    const payload = await verifyGoogleToken(credential);
+    const email = payload.email;
+    const name = payload.name || email.split('@')[0];
+    const picture = payload.picture || null;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Invalid token payload: email is missing' });
+    }
+
+    db.get(`SELECT * FROM users WHERE email = ?`, [email], (err, user) => {
+      if (err) return res.status(500).json({ error: err.message });
+
+      if (user) {
+        const token = jwt.sign({ email: user.email, id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
+        const { password: _, ...userWithoutPassword } = user;
+        return res.json({ token, user: userWithoutPassword });
+      }
+
+      db.get(`SELECT COUNT(*) as count FROM users`, [], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const role = (row.count === 0 || email === 'admin@lei.com') ? 'admin' : 'user';
+        const defaultDept = 'Google Auth';
+
+        db.run(
+          `INSERT INTO users (email, password, name, department, photo, role) VALUES (?, ?, ?, ?, ?, ?)`,
+          [email, 'GOOGLE_AUTH_NO_PASSWORD', name, defaultDept, picture, role],
+          function(err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            const newUserId = this.lastID;
+            db.get(`SELECT * FROM users WHERE id = ?`, [newUserId], (err, newUser) => {
+              if (err) return res.status(500).json({ error: err.message });
+
+              const token = jwt.sign({ email: newUser.email, id: newUser.id, role: newUser.role }, JWT_SECRET, { expiresIn: '30d' });
+              const { password: _, ...userWithoutPassword } = newUser;
+              return res.json({ token, user: userWithoutPassword });
+            });
+          }
+        );
+      });
+    });
+  } catch (error) {
+    console.error('Google login verification failed:', error.message);
+    res.status(401).json({ error: 'Google login failed: ' + error.message });
+  }
+});
+
+// Middleware to verify JWT
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) return res.status(401).json({ error: 'Authentication required' });
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ 
+        error: 'Session expired or invalid',
+        code: 'AUTH_EXPIRED'
+      });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// Middleware to verify Admin role
+const requireAdmin = (req, res, next) => {
+  if (!req.user || !req.user.email) return res.status(401).json({ error: 'Unauthorized' });
+
+  // Always allow the master admin email
+  if (req.user.email === 'admin@lei.com') return next();
+
+  db.get(`SELECT role FROM users WHERE email = ?`, [req.user.email], (err, user) => {
+    if (err) return res.status(500).json({ error: 'Database error checking role' });
+    
+    if (user && String(user.role).toLowerCase() === 'admin') {
+      next();
+    } else {
+      res.status(403).json({ error: 'Admin access required' });
+    }
+  });
+};
+
+// Middleware to verify Manager or Admin role
+const requireManager = (req, res, next) => {
+  if (!req.user || !req.user.email) return res.status(401).json({ error: 'Unauthorized' });
+
+  db.get(`SELECT role, managed_departments FROM users WHERE email = ?`, [req.user.email], (err, user) => {
+    if (err) return res.status(500).json({ error: 'Database error checking role' });
+    
+    if (user && (String(user.role).toLowerCase() === 'manager' || String(user.role).toLowerCase() === 'admin')) {
+      req.user.managed_departments = safeParse(user.managed_departments, []);
+      next();
+    } else {
+
+      res.status(403).json({ error: 'Manager access required' });
+    }
+  });
+};
+
+// --- Profile & Settings Routes ---
+
+app.get('/api/profile', authenticateToken, (req, res) => {
+  db.get(`SELECT email, name, department, designation, reporting_person, photo, role FROM users WHERE email = ?`, [req.user.email], (err, user) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(user);
+  });
+});
+
+app.post('/api/profile', authenticateToken, (req, res) => {
+  const { name, department, designation, reporting_person, photo } = req.body;
+  db.run(
+    `UPDATE users SET name = ?, department = ?, designation = ?, reporting_person = ?, photo = ? WHERE email = ?`,
+    [name, department, designation, reporting_person, photo, req.user.email],
+    function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: 'Profile updated successfully' });
+    }
+  );
+});
+
+app.get('/api/settings', authenticateToken, (req, res) => {
+  db.get(`SELECT * FROM settings WHERE user_email = ?`, [req.user.email], (err, settings) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(settings || {});
+  });
+});
+
+app.post('/api/settings', authenticateToken, (req, res) => {
+  const { theme, use_ai, report_tone, recipient_email, smart_memo } = req.body;
+  db.run(
+    `INSERT INTO settings (user_email, theme, use_ai, report_tone, recipient_email, smart_memo) 
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_email) DO UPDATE SET 
+     theme=excluded.theme, use_ai=excluded.use_ai, report_tone=excluded.report_tone, recipient_email=excluded.recipient_email, smart_memo=excluded.smart_memo`,
+    [req.user.email, theme, use_ai, report_tone, recipient_email, JSON.stringify(smart_memo || {})],
+
+    function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: 'Settings updated successfully' });
+    }
+  );
+});
+
+// --- Reports & Draft Routes ---
+
+app.get('/api/draft', authenticateToken, (req, res) => {
+  db.get(`SELECT tasks_data, start_time, end_time FROM reports WHERE user_email = ? AND category = 'DRAFT' LIMIT 1`, [req.user.email], (err, draft) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (draft) {
+      draft.tasks_data = safeParse(draft.tasks_data, []);
+    }
+    res.json(draft || { tasks_data: [] });
+  });
+
+});
+
+app.post('/api/draft', authenticateToken, (req, res) => {
+  const { tasks_data, start_time, end_time } = req.body;
+  db.run(`DELETE FROM reports WHERE user_email = ? AND category = 'DRAFT'`, [req.user.email], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    db.run(
+      `INSERT INTO reports (user_email, report_date, category, tasks_data, selected_logos, start_time, end_time) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [req.user.email, new Date().toISOString().split('T')[0], 'DRAFT', JSON.stringify(tasks_data), '[]', start_time, end_time],
+      function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ message: 'Draft saved successfully' });
+      }
+    );
+  });
+});
+
+app.get('/api/reports', authenticateToken, (req, res) => {
+  db.all(`SELECT * FROM reports WHERE user_email = ? AND category != 'DRAFT' ORDER BY report_date DESC`, [req.user.email], (err, reports) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(reports.map(r => ({
+      ...r,
+      tasks_data: safeParse(r.tasks_data, []),
+      selected_logos: safeParse(r.selected_logos, [])
+    })));
+
+  });
+});
+
+app.post('/api/reports', authenticateToken, (req, res) => {
+  const { report_date, category, tasks_data, expanded_data, selected_logos, start_time, end_time } = req.body;
+  
+  // Delete any existing report for the same user, date, and category (one report per day rule)
+  db.run(
+    `DELETE FROM reports WHERE user_email = ? AND report_date = ? AND category = ? AND category != 'DRAFT'`,
+    [req.user.email, report_date, category],
+    function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      
+      // Insert the latest version
+      db.run(
+        `INSERT INTO reports (user_email, report_date, category, tasks_data, expanded_data, selected_logos, start_time, end_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.email, report_date, category, JSON.stringify(tasks_data || []), JSON.stringify(expanded_data || []), JSON.stringify(selected_logos || []), start_time, end_time],
+
+        function(err) {
+          if (err) return res.status(500).json({ error: err.message });
+          res.status(201).json({ message: 'Report saved successfully', reportId: this.lastID });
+        }
+      );
+    }
+  );
+});
+
+// --- Admin Routes ---
+
+app.get('/api/admin/users', authenticateToken, requireAdmin, (req, res) => {
+  console.log('Fetching all users for admin');
+  db.all(`SELECT id, email, name, department, designation, reporting_person, role, managed_departments, created_at FROM users`, [], (err, users) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(users.map(u => ({ ...u, managed_departments: safeParse(u.managed_departments, []) })));
+  });
+
+});
+
+app.get('/api/admin/all-reports', authenticateToken, requireAdmin, (req, res) => {
+  db.all(`SELECT reports.*, users.name as user_name FROM reports JOIN users ON reports.user_email = users.email ORDER BY report_date DESC`, [], (err, reports) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(reports.map(r => ({
+      ...r,
+      tasks_data: safeParse(r.tasks_data, []),
+      expanded_data: safeParse(r.expanded_data, []),
+      selected_logos: safeParse(r.selected_logos, [])
+    })));
+
+  });
+});
+
+app.get('/api/admin/user-reports/:email', authenticateToken, requireAdmin, (req, res) => {
+  db.all(`SELECT * FROM reports WHERE user_email = ? ORDER BY report_date DESC`, [req.params.email], (err, reports) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(reports.map(r => ({
+      ...r,
+      tasks_data: safeParse(r.tasks_data, []),
+      selected_logos: safeParse(r.selected_logos, [])
+    })));
+
+  });
+});
+
+app.post('/api/admin/update-user', authenticateToken, requireAdmin, (req, res) => {
+  const { email, role, name, department, designation, reporting_person } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+  
+  const updates = [];
+  const params = [];
+  
+  if (role) { updates.push('role = ?'); params.push(String(role).toLowerCase()); }
+  if (name) { updates.push('name = ?'); params.push(name); }
+  if (department) { updates.push('department = ?'); params.push(department); }
+  if (designation) { updates.push('designation = ?'); params.push(designation); }
+  if (reporting_person) { updates.push('reporting_person = ?'); params.push(reporting_person); }
+  if (req.body.managed_departments) { 
+    updates.push('managed_departments = ?'); 
+    params.push(JSON.stringify(req.body.managed_departments)); 
+  }
+  
+  if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+  
+  params.push(email);
+  db.run(`UPDATE users SET ${updates.join(', ')} WHERE email = ?`, params, function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ message: 'User updated successfully' });
+  });
+});
+
+app.post('/api/admin/delete-user', authenticateToken, requireAdmin, (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+  if (email === 'admin@lei.com') return res.status(403).json({ error: 'Cannot delete master admin' });
+
+  db.run(`DELETE FROM users WHERE email = ?`, [email], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    
+    // Cleanup associated data
+    db.run(`DELETE FROM reports WHERE user_email = ?`, [email]);
+    db.run(`DELETE FROM settings WHERE user_email = ?`, [email]);
+    
+    res.json({ message: 'User and associated records deleted permanently' });
+  });
+});
+
+app.post('/api/admin/reset-password', authenticateToken, requireAdmin, async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+
+  try {
+    const tempPassword = 'lei' + Math.floor(1000 + Math.random() * 9000);
+    const hashedPassword = await bcrypt.hash(tempPassword, 10);
+    
+    db.run(`UPDATE users SET password = ? WHERE email = ?`, [hashedPassword, email], function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ 
+        message: `Key reset successful. New temporary key: ${tempPassword}`,
+        tempPassword 
+      });
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error during key reset' });
+  }
+});
+
+// --- Manager Routes ---
+
+app.get('/api/manager/workforce', authenticateToken, requireManager, (req, res) => {
+  const depts = req.user.managed_departments;
+  if (!depts || depts.length === 0) return res.json([]);
+
+  const placeholders = depts.map(() => '?').join(',');
+  db.all(`SELECT id, email, name, department, designation, reporting_person, role, created_at FROM users WHERE department IN (${placeholders})`, depts, (err, users) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(users);
+  });
+});
+
+app.get('/api/manager/reports', authenticateToken, requireManager, (req, res) => {
+  const depts = req.user.managed_departments;
+  if (!depts || depts.length === 0) return res.json([]);
+
+  const placeholders = depts.map(() => '?').join(',');
+  db.all(`
+    SELECT reports.*, users.name as user_name 
+    FROM reports 
+    JOIN users ON reports.user_email = users.email 
+    WHERE users.department IN (${placeholders}) 
+    ORDER BY reports.report_date DESC
+  `, depts, (err, reports) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(reports.map(r => ({
+      ...r,
+      tasks_data: safeParse(r.tasks_data, []),
+      expanded_data: safeParse(r.expanded_data, []),
+      selected_logos: safeParse(r.selected_logos, [])
+    })));
+
+  });
+});
+
+// --- SPA Catch-all Route (Keep this at the end) ---
+app.get('/{*path}', (req, res) => {
+  res.sendFile(path.join(distPath, 'index.html'));
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+
+  console.log(`Server is running!`);
+  console.log(`- Local: http://localhost:${PORT}`);
+  console.log(`- API Base: /api`);
+  console.log(`- JWT Secret configured: ${process.env.JWT_SECRET ? 'YES' : 'NO (using default)'}`);
+  console.log(`- Allowed Origins: ${allowedOrigins.join(', ')}`);
+});
