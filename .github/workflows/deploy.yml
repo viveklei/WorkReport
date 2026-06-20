@@ -1,0 +1,68 @@
+name: Deploy Work Report Portal
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: 'npm'
+
+    - name: Install Dependencies
+      run: npm ci
+
+    - name: Build Frontend
+      run: npm run build
+
+    - name: Copy Files to VPS via SSH
+      uses: appleboy/scp-action@master
+      with:
+        host: ${{ secrets.VPS_SSH_HOST }}
+        username: ${{ secrets.VPS_SSH_USERNAME }}
+        key: ${{ secrets.VPS_SSH_KEY }}
+        source: "*,!node_modules,!.git,!deployment_package.zip,!deployyyy.zip"
+        target: "/var/www/work-report"
+        strip_components: 0
+
+    - name: Run Deploy Steps on VPS
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.VPS_SSH_HOST }}
+        username: ${{ secrets.VPS_SSH_USERNAME }}
+        key: ${{ secrets.VPS_SSH_KEY }}
+        script: |
+          cd /var/www/work-report
+          
+          # Initialize server environment configuration
+          if [ ! -f server/.env ]; then
+            echo "Creating server/.env file..."
+            echo "PORT=5003" > server/.env
+            echo "JWT_SECRET=${{ secrets.JWT_SECRET || 'lei-report-portal-secret-key-2026-production' }}" >> server/.env
+            echo "NODE_ENV=production" >> server/.env
+          fi
+          
+          # Install production packages only
+          npm install --production
+          
+          # Use PM2 to run the Express API server
+          if pm2 describe work-report > /dev/null 2>&1; then
+            echo "Restarting existing PM2 instance..."
+            pm2 restart work-report
+          else
+            echo "Starting new PM2 instance..."
+            pm2 start server/index.js --name "work-report"
+          fi
+          
+          # Save PM2 listing to persist across reboots
+          pm2 save
